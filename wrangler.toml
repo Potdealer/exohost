@@ -1,0 +1,13 @@
+name = "mfer-one-gateway"
+main = "cloudflare-worker.js"
+compatibility_date = "2024-01-01"
+
+# Route patterns for mfer.one
+# Requires DNS zone for mfer.one in Cloudflare
+[[routes]]
+pattern = "*.mfer.one/*"
+zone_name = "mfer.one"
+
+[[routes]]
+pattern = "mfer.one/*"
+zone_name = "mfer.one"

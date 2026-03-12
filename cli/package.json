@@ -1,0 +1,17 @@
+{
+  "name": "exohost",
+  "version": "0.1.0",
+  "description": "CLI for ExoHost — decentralized website hosting on Base",
+  "type": "module",
+  "bin": {
+    "exohost": "./bin/exohost.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["exohost", "decentralized", "hosting", "base", "onchain", "net-protocol"],
+  "license": "MIT"
+}
