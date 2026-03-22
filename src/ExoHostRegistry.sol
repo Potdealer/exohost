@@ -10,14 +10,13 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 /// @dev Names are ERC-721 NFTs. The gateway reads this contract to resolve
 ///      {name}.exohost.xyz → Net Protocol storage → serve HTML.
 contract ExoHostRegistry is ERC721, Ownable {
-
     // ─── Storage ────────────────────────────────────────────────
 
     /// @notice Site configuration for a registered name
     struct Site {
-        address storageWallet;   // Wallet whose Net Protocol storage holds the site files
-        string homepageKey;      // Net Protocol storage key for the index page
-        uint256 pageCount;       // Number of page routes configured
+        address storageWallet; // Wallet whose Net Protocol storage holds the site files
+        string homepageKey; // Net Protocol storage key for the index page
+        uint256 pageCount; // Number of page routes configured
     }
 
     /// @notice Token ID counter (also serves as total registered count)
@@ -83,11 +82,7 @@ contract ExoHostRegistry is ERC721, Ownable {
     /// @param name The name to register (lowercase alphanumeric + hyphens)
     /// @param storageWallet The wallet whose Net Protocol storage holds site files
     /// @param homepageKey The Net Protocol storage key for the index page
-    function register(
-        string calldata name,
-        address storageWallet,
-        string calldata homepageKey
-    ) external payable {
+    function register(string calldata name, address storageWallet, string calldata homepageKey) external payable {
         // Validate name
         _validateName(name);
 
@@ -103,11 +98,7 @@ contract ExoHostRegistry is ERC721, Ownable {
         nameToTokenId[name] = tokenId;
         tokenIdToName[tokenId] = name;
 
-        sites[tokenId] = Site({
-            storageWallet: storageWallet,
-            homepageKey: homepageKey,
-            pageCount: 0
-        });
+        sites[tokenId] = Site({storageWallet: storageWallet, homepageKey: homepageKey, pageCount: 0});
 
         _mint(msg.sender, tokenId);
 
@@ -115,7 +106,7 @@ contract ExoHostRegistry is ERC721, Ownable {
 
         // Refund excess
         if (msg.value > price) {
-            (bool ok, ) = msg.sender.call{value: msg.value - price}("");
+            (bool ok,) = msg.sender.call{value: msg.value - price}("");
             require(ok);
         }
     }
@@ -135,7 +126,7 @@ contract ExoHostRegistry is ERC721, Ownable {
 
         sites[tokenId] = Site({
             storageWallet: msg.sender,
-            homepageKey: name,  // Default: use the name as the storage key
+            homepageKey: name, // Default: use the name as the storage key
             pageCount: 0
         });
 
@@ -144,7 +135,7 @@ contract ExoHostRegistry is ERC721, Ownable {
         emit NameRegistered(tokenId, name, msg.sender);
 
         if (msg.value > price) {
-            (bool ok, ) = msg.sender.call{value: msg.value - price}("");
+            (bool ok,) = msg.sender.call{value: msg.value - price}("");
             require(ok);
         }
     }
@@ -201,11 +192,11 @@ contract ExoHostRegistry is ERC721, Ownable {
     /// @return owner The name owner
     /// @return storageWallet The wallet holding the site's Net storage
     /// @return homepageKey The storage key for the index page
-    function resolve(string calldata name) external view returns (
-        address owner,
-        address storageWallet,
-        string memory homepageKey
-    ) {
+    function resolve(string calldata name)
+        external
+        view
+        returns (address owner, address storageWallet, string memory homepageKey)
+    {
         uint256 tokenId = nameToTokenId[name];
         if (tokenId == 0) return (address(0), address(0), "");
 
@@ -216,10 +207,11 @@ contract ExoHostRegistry is ERC721, Ownable {
     /// @notice Resolve a specific page route for a name
     /// @return storageWallet The wallet holding the site's Net storage
     /// @return key The storage key for the requested page
-    function resolvePage(string calldata name, string calldata route) external view returns (
-        address storageWallet,
-        string memory key
-    ) {
+    function resolvePage(string calldata name, string calldata route)
+        external
+        view
+        returns (address storageWallet, string memory key)
+    {
         uint256 tokenId = nameToTokenId[name];
         if (tokenId == 0) return (address(0), "");
 
@@ -265,7 +257,7 @@ contract ExoHostRegistry is ERC721, Ownable {
 
     /// @notice Withdraw collected fees
     function withdraw() external onlyOwner {
-        (bool ok, ) = owner().call{value: address(this).balance}("");
+        (bool ok,) = owner().call{value: address(this).balance}("");
         require(ok);
     }
 
@@ -286,9 +278,9 @@ contract ExoHostRegistry is ERC721, Ownable {
         for (uint256 i; i < len; i++) {
             bytes1 c = b[i];
             // a-z: 0x61-0x7A, 0-9: 0x30-0x39, hyphen: 0x2D
-            bool valid = (c >= 0x61 && c <= 0x7A) || // a-z
-                         (c >= 0x30 && c <= 0x39) || // 0-9
-                         (c == 0x2D);                 // -
+            bool valid = (c >= 0x61 && c <= 0x7A) // a-z
+                || (c >= 0x30 && c <= 0x39) // 0-9
+                || (c == 0x2D); // -
             if (!valid) revert InvalidCharacter();
         }
     }
