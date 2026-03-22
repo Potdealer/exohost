@@ -8,7 +8,7 @@
 
 // ─── Configuration ─────────────────────────────────────────
 const EXOHOST_REGISTRY = '0x71329A553e4134dE482725f98e10A4cBd90751f7';    // V1
-const EXOHOST_REGISTRY_V2 = '0x0000000000000000000000000000000000000000';  // V2 — UPDATE after deployment
+const EXOHOST_REGISTRY_V2 = '0x23FE77c6F53889f104841a71783189e5b66aa3Ba';  // V2 — deployed Mar 22 2026
 const BASE_RPC = 'https://base-rpc.publicnode.com';
 const STOREDON_BASE = 'https://storedon.net/net/8453/storage/load';
 const GATEWAY_DOMAIN = 'mfer.one';
