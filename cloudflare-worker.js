@@ -7,14 +7,17 @@
  */
 
 // ─── Configuration ─────────────────────────────────────────
-const EXOHOST_REGISTRY = '0x71329A553e4134dE482725f98e10A4cBd90751f7';
-const BASE_RPC = 'https://mainnet.base.org';
+const EXOHOST_REGISTRY = '0x71329A553e4134dE482725f98e10A4cBd90751f7';    // V1
+const EXOHOST_REGISTRY_V2 = '0x0000000000000000000000000000000000000000';  // V2 — UPDATE after deployment
+const BASE_RPC = 'https://base-rpc.publicnode.com';
 const STOREDON_BASE = 'https://storedon.net/net/8453/storage/load';
 const GATEWAY_DOMAIN = 'mfer.one';
 
 // Function selectors (keccak256 first 4 bytes)
 const RESOLVE_SELECTOR = '0x461a4478';      // resolve(string)
 const RESOLVE_PAGE_SELECTOR = '0xad67af91'; // resolvePage(string,string)
+const NAME_TO_TOKEN_ID_SELECTOR = '0xdd001254'; // nameToTokenId(string)
+const GET_PAGE_SELECTOR = '0x137a3c96';          // getPage(uint256)
 
 // ─── ABI Encoding Helpers ──────────────────────────────────
 
@@ -106,6 +109,68 @@ function decodeResolvePage(result) {
   return { wallet, key };
 }
 
+/**
+ * Encode nameToTokenId(string name) calldata
+ */
+function encodeNameToTokenId(name) {
+  const offset = '0000000000000000000000000000000000000000000000000000000000000020';
+  return NAME_TO_TOKEN_ID_SELECTOR + offset + abiEncodeString(name);
+}
+
+/**
+ * Encode getPage(uint256 tokenId) calldata
+ */
+function encodeGetPage(tokenId) {
+  const id = tokenId.toString(16).padStart(64, '0');
+  return GET_PAGE_SELECTOR + id;
+}
+
+/**
+ * Decode a uint256 return value
+ */
+function decodeUint256(result) {
+  if (!result || result === '0x' || result.length < 66) return 0;
+  return parseInt(result.slice(2, 66), 16);
+}
+
+/**
+ * Decode a string return value (single dynamic string)
+ */
+function decodeString(result) {
+  if (!result || result === '0x' || result.length < 130) return '';
+  const data = result.slice(2);
+  const strOffset = parseInt(data.slice(0, 64), 16) * 2;
+  const strLen = parseInt(data.slice(strOffset, strOffset + 64), 16);
+  if (strLen === 0) return '';
+  const strHex = data.slice(strOffset + 64, strOffset + 64 + strLen * 2);
+  return new TextDecoder().decode(new Uint8Array(
+    strHex.match(/.{2}/g).map(b => parseInt(b, 16))
+  ));
+}
+
+/**
+ * Check V2 contract for onchain page content.
+ * Returns the HTML string if found, or null if no page stored.
+ */
+async function getV2OnchainPage(name) {
+  // Skip if V2 not deployed yet
+  if (EXOHOST_REGISTRY_V2 === '0x0000000000000000000000000000000000000000') return null;
+
+  try {
+    // Get tokenId for name
+    const tokenIdResult = await ethCall(EXOHOST_REGISTRY_V2, encodeNameToTokenId(name));
+    const tokenId = decodeUint256(tokenIdResult);
+    if (tokenId === 0) return null; // Not registered on V2
+
+    // Get page content
+    const pageResult = await ethCall(EXOHOST_REGISTRY_V2, encodeGetPage(tokenId));
+    const content = decodeString(pageResult);
+    return content.length > 0 ? content : null;
+  } catch {
+    return null; // V2 call failed, fall back to V1/Net Protocol
+  }
+}
+
 // ─── CORS Headers ──────────────────────────────────────────
 
 const CORS_HEADERS = {
@@ -150,6 +215,24 @@ export default {
       let route = url.pathname.replace(/\/+$/, '').replace(/^\//, '') || '';
       route = route.replace(/\.html$/, '');
 
+      const htmlHeaders = {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-cache, must-revalidate',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'SAMEORIGIN',
+        'X-Powered-By': 'mfer.one — onchain hosting on Base',
+        ...CORS_HEADERS,
+      };
+
+      // ── Priority 1: Check V2 onchain page (homepage only) ──
+      if (!route || route === 'index') {
+        const onchainPage = await getV2OnchainPage(name);
+        if (onchainPage) {
+          return new Response(onchainPage, { headers: htmlHeaders });
+        }
+      }
+
+      // ── Priority 2: Fall back to V1 + Net Protocol storage ──
       let wallet, storageKey;
 
       if (route && route !== 'index') {
@@ -169,7 +252,7 @@ export default {
           storageKey = `${site.key}-${route}`;
         }
       } else {
-        // Homepage
+        // Homepage — V2 didn't have it, check V1
         const resolveResult = await ethCall(EXOHOST_REGISTRY, encodeResolve(name));
         const site = decodeResolve(resolveResult);
         if (!site) return notFoundPage(name);
@@ -177,25 +260,16 @@ export default {
         storageKey = site.key;
       }
 
-      // Fetch content from Net Protocol
-      const storeUrl = `${STOREDON_BASE}/${wallet}/${storageKey}`;
-      const response = await fetch(storeUrl);
+      // Fetch content from Net Protocol (bust cache with timestamp)
+      const storeUrl = `${STOREDON_BASE}/${wallet}/${storageKey}?_t=${Date.now()}`;
+      const response = await fetch(storeUrl, { cf: { cacheTtl: 0, cacheEverything: false } });
 
       if (!response.ok) {
         return pageNotUploaded(name, route, storageKey);
       }
 
       const html = await response.text();
-      return new Response(html, {
-        headers: {
-          'Content-Type': 'text/html; charset=utf-8',
-          'Cache-Control': 'public, max-age=300',
-          'X-Content-Type-Options': 'nosniff',
-          'X-Frame-Options': 'SAMEORIGIN',
-          'X-Powered-By': 'mfer.one — onchain hosting on Base',
-          ...CORS_HEADERS,
-        },
-      });
+      return new Response(html, { headers: htmlHeaders });
 
     } catch (err) {
       return errorPage(err.message);
@@ -332,9 +406,9 @@ function landingPage() {
       <h2>pricing (one-time, forever)</h2>
       <table>
         <tr><th>Name Length</th><th>Fee</th></tr>
-        <tr><td>3 characters</td><td>0.1 ETH</td></tr>
-        <tr><td>4 characters</td><td>0.01 ETH</td></tr>
-        <tr><td>5+ characters</td><td>0.001 ETH</td></tr>
+        <tr><td>3 characters</td><td>0.01 ETH</td></tr>
+        <tr><td>4 characters</td><td>0.001 ETH</td></tr>
+        <tr><td>5+ characters</td><td>FREE</td></tr>
       </table>
     </div>
 
