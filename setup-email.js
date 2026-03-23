@@ -3,9 +3,12 @@
 /**
  * setup-email.js — Guide for setting up mfer.one email infrastructure.
  *
- * Two systems:
- *   1. Resend — outbound email (agents send FROM @mfer.one)
- *   2. Cloudflare Email Routing — inbound email (receives TO @mfer.one, triggers worker)
+ * Architecture (v2 — KV-backed, no tunnel):
+ *   Inbound:  Cloudflare Email Routing -> email-worker.js -> Cloudflare KV
+ *   Outbound: Resend API (agents send FROM @mfer.one)
+ *   Reading:  Agents call email-worker.js HTTP API with X-Api-Key auth
+ *
+ * No tunnel, no home PC, no single point of failure.
  *
  * Usage: node setup-email.js [verify]
  */
@@ -24,71 +27,83 @@ async function main() {
   }
 
   console.log(`
-=== mfer.one Email Setup Guide ===
+=== mfer.one Email Setup Guide (v2 — KV-backed) ===
 
-Two systems need configuring:
+--- 1. INBOUND: Cloudflare Email Worker + KV ---
 
---- 1. OUTBOUND: Resend (sending email from @mfer.one) ---
+Already deployed: mfer-one-email worker with KV storage.
+Worker URL: https://mfer-one-email.iampotdealer.workers.dev
 
-a) Add domain to Resend:
-   - Go to https://resend.com/domains
+Remaining steps (potdealer must do in Cloudflare dashboard):
+
+a) Go to: Cloudflare dashboard > mfer.one > Email > Email Routing
+b) Enable Email Routing (Cloudflare adds MX records automatically)
+c) Add catch-all rule: *@${DOMAIN} -> Send to Worker -> mfer-one-email
+d) Optionally set fallback email:
+   CLOUDFLARE_API_TOKEN=<token> npx wrangler secret put FALLBACK_EMAIL -c wrangler-email.toml
+
+--- 2. OUTBOUND: Resend (sending email from @mfer.one) ---
+
+potdealer must do these manually:
+
+a) Go to https://resend.com/domains
    - Click "Add Domain" -> enter "${DOMAIN}"
-   - Resend will give you DNS records to add
+   - Resend gives you DNS records to add
 
 b) Add these DNS records in Cloudflare (mfer.one zone):
 
-   TYPE    NAME                    VALUE
-   ----    ----                    -----
-   TXT     ${DOMAIN}              v=spf1 include:send.resend.com ~all
-   TXT     resend._domainkey      (DKIM value from Resend dashboard)
-   TXT     _dmarc                 v=DMARC1; p=none; rua=mailto:dmarc@${DOMAIN}
-   MX      send                   feedback-smtp.us-east-1.amazonses.com (priority 10)
+   TYPE    NAME                           VALUE
+   ----    ----                           -----
+   TXT     ${DOMAIN}                      v=spf1 include:send.resend.com ~all
+   TXT     resend._domainkey.${DOMAIN}    (DKIM value from Resend dashboard)
+   TXT     _dmarc.${DOMAIN}              v=DMARC1; p=none;
+   MX      send.${DOMAIN}                feedback-smtp.us-east-1.amazonses.com (priority 10)
 
-c) Verify domain in Resend dashboard
+c) Verify domain in Resend dashboard (click "Verify" after DNS propagates)
 
 d) Set RESEND_API_KEY in your .env file
 
-e) Test: node -e "
-   import { sendEmail } from './src/primitives/email.js';
-   sendEmail('test@example.com', 'Test from mfer.one', 'It works!', { from: 'ollie@${DOMAIN}' });
-"
+--- 3. API USAGE ---
 
---- 2. INBOUND: Cloudflare Email Routing (receiving email at @mfer.one) ---
+Reading inbox (for agents):
 
-a) In Cloudflare dashboard, go to: mfer.one > Email > Email Routing
+   # List ollie's inbox
+   curl -H "X-Api-Key: <EMAIL_API_KEY>" \\
+     https://mfer-one-email.iampotdealer.workers.dev/inbox/ollie
 
-b) Enable Email Routing (Cloudflare adds MX records automatically)
+   # Read specific email
+   curl -H "X-Api-Key: <EMAIL_API_KEY>" \\
+     https://mfer-one-email.iampotdealer.workers.dev/inbox/ollie/<messageId>
 
-c) Deploy the email worker:
-   npx wrangler deploy -c wrangler-email.toml
+   # Unread count
+   curl -H "X-Api-Key: <EMAIL_API_KEY>" \\
+     https://mfer-one-email.iampotdealer.workers.dev/inbox/ollie/unread
 
-d) Set the fallback email secret:
-   npx wrangler secret put FALLBACK_EMAIL -c wrangler-email.toml
-   (Enter your backup email when prompted)
+   # Mark as read
+   curl -X POST -H "X-Api-Key: <EMAIL_API_KEY>" \\
+     https://mfer-one-email.iampotdealer.workers.dev/inbox/ollie/<messageId>/read
 
-e) Add catch-all route:
-   - In Email Routing > Routing Rules
-   - Add rule: Catch-all (*@${DOMAIN}) -> Send to Worker -> mfer-one-email
+   # Delete
+   curl -X DELETE -H "X-Api-Key: <EMAIL_API_KEY>" \\
+     https://mfer-one-email.iampotdealer.workers.dev/inbox/ollie/<messageId>
 
-f) Update WEBHOOK_BASE_URL in wrangler-email.toml to point to your
-   Reach webhook server's public URL (or use a tunnel for local dev)
+--- 4. DNS RECORDS SUMMARY ---
 
---- 3. DNS RECORDS SUMMARY ---
+After everything is configured, mfer.one DNS should have:
 
-After both are configured, your mfer.one DNS should have:
+   TYPE    NAME                           VALUE
+   ----    ----                           -----
+   MX      ${DOMAIN}                      (auto-added by Cloudflare Email Routing)
+   TXT     ${DOMAIN}                      v=spf1 include:send.resend.com ~all
+   TXT     resend._domainkey.${DOMAIN}    (from Resend dashboard)
+   TXT     _dmarc.${DOMAIN}              v=DMARC1; p=none;
+   MX      send.${DOMAIN}                feedback-smtp.us-east-1.amazonses.com (priority 10)
+   CNAME   *                              (existing — mfer-one-gateway worker)
 
-   TYPE    NAME                    VALUE
-   ----    ----                    -----
-   MX      ${DOMAIN}              (auto-added by Cloudflare Email Routing)
-   TXT     ${DOMAIN}              v=spf1 include:send.resend.com ~all
-   TXT     resend._domainkey      (from Resend dashboard)
-   TXT     _dmarc                 v=DMARC1; p=none
-   CNAME   *                      (existing — points to mfer-one-gateway worker)
+--- 5. TESTING ---
 
---- 4. TESTING ---
-
-Outbound: reach email test@example.com "Test" "Hello from mfer.one"
-Inbound:  Send email to ollie@mfer.one, check webhook logs + fallback inbox
+Inbound:  Send email to ollie@${DOMAIN}, check API /inbox/ollie
+Outbound: reach email test@example.com "Test" "Hello from ${DOMAIN}"
 `);
 }
 

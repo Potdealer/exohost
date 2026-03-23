@@ -1,12 +1,19 @@
 /**
- * mfer.one Email Worker — handles incoming email for all @mfer.one addresses.
+ * mfer.one Email Worker — Cloudflare KV-backed email system.
  *
- * Flow:
- *   1. Someone sends email to agent@mfer.one
- *   2. Cloudflare Email Routing triggers this worker
- *   3. Worker parses the email, extracts headers/body
- *   4. POSTs JSON payload to the agent's webhook endpoint
- *   5. Forwards a copy to FALLBACK_EMAIL as backup
+ * No tunnel, no home PC, no single point of failure.
+ *
+ * Inbound:
+ *   email() handler receives all @mfer.one mail via Cloudflare Email Routing,
+ *   parses it, and stores to KV keyed by recipient + messageId.
+ *
+ * API:
+ *   fetch() handler exposes REST endpoints for agents to read their inbox.
+ *   Auth: X-Api-Key header must match EMAIL_API_KEY secret.
+ *
+ * KV Schema:
+ *   inbox:{localPart}:{messageId}  →  full email JSON
+ *   inbox:{localPart}:index        →  array of { messageId, from, subject, timestamp, read }
  *
  * Deploy: npx wrangler deploy -c wrangler-email.toml
  */
@@ -14,10 +21,21 @@
 // Max email body size to process (256KB)
 const MAX_BODY_SIZE = 256 * 1024;
 
-// Max number of lines to keep from body (prevent huge emails)
+// Max number of lines to keep from body
 const MAX_BODY_LINES = 500;
 
+// Max emails per inbox
+const MAX_INBOX_SIZE = 100;
+
+// CORS headers for API responses
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Api-Key',
+};
+
 export default {
+  // ─── Incoming Email Handler ──────────────────────────────
   async email(message, env, ctx) {
     const from = message.from;
     const to = message.to;
@@ -30,7 +48,7 @@ export default {
     // Extract the local part (agent name) from the recipient address
     const localPart = to.split('@')[0].toLowerCase();
 
-    console.log(`[email-worker] Incoming: ${from} -> ${to} (${localPart}) Subject: "${subject}"`);
+    console.log(`[email] Incoming: ${from} -> ${to} (${localPart}) Subject: "${subject}"`);
 
     // Read the raw email body
     let rawBody = '';
@@ -51,51 +69,79 @@ export default {
         rawBody += decoder.decode(value, { stream: true });
       }
     } catch (err) {
-      console.log(`[email-worker] Error reading body: ${err.message}`);
+      console.log(`[email] Error reading body: ${err.message}`);
       rawBody = '(error reading email body)';
     }
 
-    // Parse the email body — extract text content from the raw MIME
-    const body = extractTextBody(rawBody);
+    // Parse the email body — extract text content from raw MIME
+    let body = extractTextBody(rawBody);
 
     // Truncate body lines
     const lines = body.split('\n');
-    const truncatedBody = lines.length > MAX_BODY_LINES
-      ? lines.slice(0, MAX_BODY_LINES).join('\n') + '\n\n[... truncated]'
-      : body;
+    if (lines.length > MAX_BODY_LINES) {
+      body = lines.slice(0, MAX_BODY_LINES).join('\n') + '\n\n[... truncated]';
+    }
 
-    // Build the JSON payload
-    const payload = {
+    const timestamp = new Date().toISOString();
+
+    // Sanitize messageId for use as KV key (remove angle brackets, slashes)
+    const safeMessageId = messageId.replace(/[<>\/\\]/g, '_').slice(0, 200);
+
+    // Full email data
+    const emailData = {
+      messageId: safeMessageId,
       from,
       to,
       localPart,
       subject,
-      body: truncatedBody,
-      timestamp: new Date().toISOString(),
-      messageId,
+      body,
+      timestamp,
       inReplyTo,
       references,
       date,
+      read: false,
     };
 
-    // POST to the agent's webhook endpoint
-    const webhookBaseUrl = env.WEBHOOK_BASE_URL || 'http://localhost:8430';
-    const webhookUrl = `${webhookBaseUrl}/email`;
+    // Index entry (no body — keeps index small)
+    const indexEntry = {
+      messageId: safeMessageId,
+      from,
+      subject,
+      timestamp,
+      read: false,
+    };
 
     try {
-      const response = await fetch(webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
+      // Store full email
+      await env.EMAIL_KV.put(
+        `inbox:${localPart}:${safeMessageId}`,
+        JSON.stringify(emailData),
+        { expirationTtl: 60 * 60 * 24 * 90 } // 90 day TTL
+      );
 
-      if (response.ok) {
-        console.log(`[email-worker] Webhook delivered to ${webhookUrl}`);
-      } else {
-        console.log(`[email-worker] Webhook failed: ${response.status} ${response.statusText}`);
+      // Update index
+      const indexKey = `inbox:${localPart}:index`;
+      let index = [];
+      const existing = await env.EMAIL_KV.get(indexKey);
+      if (existing) {
+        try { index = JSON.parse(existing); } catch {}
       }
+
+      // Add new entry at the beginning (newest first)
+      index.unshift(indexEntry);
+
+      // Cap at MAX_INBOX_SIZE — remove oldest
+      while (index.length > MAX_INBOX_SIZE) {
+        const removed = index.pop();
+        // Delete the old email from KV
+        await env.EMAIL_KV.delete(`inbox:${localPart}:${removed.messageId}`);
+      }
+
+      await env.EMAIL_KV.put(indexKey, JSON.stringify(index));
+
+      console.log(`[email] Stored to KV: inbox:${localPart}:${safeMessageId}`);
     } catch (err) {
-      console.log(`[email-worker] Webhook error: ${err.message}`);
+      console.log(`[email] KV store error: ${err.message}`);
     }
 
     // Forward to fallback email as backup
@@ -103,13 +149,204 @@ export default {
     if (fallbackEmail) {
       try {
         await message.forward(fallbackEmail);
-        console.log(`[email-worker] Forwarded to fallback: ${fallbackEmail}`);
+        console.log(`[email] Forwarded to fallback`);
       } catch (err) {
-        console.log(`[email-worker] Forward failed: ${err.message}`);
+        console.log(`[email] Forward failed: ${err.message}`);
       }
     }
   },
+
+  // ─── HTTP API Handler ────────────────────────────────────
+  async fetch(request, env, ctx) {
+    // Handle CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // Health check — no auth needed
+    if (path === '/' || path === '/health') {
+      return json({ status: 'ok', service: 'mfer-one-email' });
+    }
+
+    // Auth check for all /inbox routes
+    const apiKey = request.headers.get('X-Api-Key');
+    if (!apiKey || apiKey !== env.EMAIL_API_KEY) {
+      return json({ error: 'Unauthorized' }, 401);
+    }
+
+    // Route: GET /inbox/:name — list emails
+    const listMatch = path.match(/^\/inbox\/([a-zA-Z0-9._-]+)$/);
+    if (listMatch && request.method === 'GET') {
+      const name = listMatch[1].toLowerCase();
+      return await handleListInbox(name, url, env);
+    }
+
+    // Route: GET /inbox/:name/unread — unread count
+    const unreadMatch = path.match(/^\/inbox\/([a-zA-Z0-9._-]+)\/unread$/);
+    if (unreadMatch && request.method === 'GET') {
+      const name = unreadMatch[1].toLowerCase();
+      return await handleUnreadCount(name, env);
+    }
+
+    // Route: GET /inbox/:name/:messageId — read specific email
+    const readMatch = path.match(/^\/inbox\/([a-zA-Z0-9._-]+)\/([^/]+)$/);
+    if (readMatch && request.method === 'GET') {
+      const name = readMatch[1].toLowerCase();
+      const messageId = decodeURIComponent(readMatch[2]);
+      return await handleReadEmail(name, messageId, env);
+    }
+
+    // Route: POST /inbox/:name/:messageId/read — mark as read
+    const markReadMatch = path.match(/^\/inbox\/([a-zA-Z0-9._-]+)\/([^/]+)\/read$/);
+    if (markReadMatch && request.method === 'POST') {
+      const name = markReadMatch[1].toLowerCase();
+      const messageId = decodeURIComponent(markReadMatch[2]);
+      return await handleMarkRead(name, messageId, env);
+    }
+
+    // Route: DELETE /inbox/:name/:messageId — delete email
+    const deleteMatch = path.match(/^\/inbox\/([a-zA-Z0-9._-]+)\/([^/]+)$/);
+    if (deleteMatch && request.method === 'DELETE') {
+      const name = deleteMatch[1].toLowerCase();
+      const messageId = decodeURIComponent(deleteMatch[2]);
+      return await handleDeleteEmail(name, messageId, env);
+    }
+
+    return json({ error: 'Not found' }, 404);
+  },
 };
+
+// ─── API Handlers ────────────────────────────────────────
+
+async function handleListInbox(name, url, env) {
+  const indexKey = `inbox:${name}:index`;
+  const raw = await env.EMAIL_KV.get(indexKey);
+  if (!raw) {
+    return json({ name, emails: [], total: 0 });
+  }
+
+  let index = [];
+  try { index = JSON.parse(raw); } catch {}
+
+  // Optional filters via query params
+  const unreadOnly = url.searchParams.get('unread') === 'true';
+  const fromFilter = url.searchParams.get('from');
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 100);
+  const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+
+  let results = index;
+
+  if (unreadOnly) {
+    results = results.filter(e => !e.read);
+  }
+  if (fromFilter) {
+    const f = fromFilter.toLowerCase();
+    results = results.filter(e => e.from.toLowerCase().includes(f));
+  }
+
+  const total = results.length;
+  results = results.slice(offset, offset + limit);
+
+  return json({ name, emails: results, total, offset, limit });
+}
+
+async function handleUnreadCount(name, env) {
+  const indexKey = `inbox:${name}:index`;
+  const raw = await env.EMAIL_KV.get(indexKey);
+  if (!raw) {
+    return json({ name, unread: 0 });
+  }
+
+  let index = [];
+  try { index = JSON.parse(raw); } catch {}
+
+  const unread = index.filter(e => !e.read).length;
+  return json({ name, unread });
+}
+
+async function handleReadEmail(name, messageId, env) {
+  const key = `inbox:${name}:${messageId}`;
+  const raw = await env.EMAIL_KV.get(key);
+  if (!raw) {
+    return json({ error: 'Email not found' }, 404);
+  }
+
+  let email;
+  try { email = JSON.parse(raw); } catch {
+    return json({ error: 'Corrupt email data' }, 500);
+  }
+
+  return json(email);
+}
+
+async function handleMarkRead(name, messageId, env) {
+  // Update the email record
+  const emailKey = `inbox:${name}:${messageId}`;
+  const raw = await env.EMAIL_KV.get(emailKey);
+  if (!raw) {
+    return json({ error: 'Email not found' }, 404);
+  }
+
+  let email;
+  try { email = JSON.parse(raw); } catch {
+    return json({ error: 'Corrupt email data' }, 500);
+  }
+
+  email.read = true;
+  await env.EMAIL_KV.put(emailKey, JSON.stringify(email), {
+    expirationTtl: 60 * 60 * 24 * 90,
+  });
+
+  // Update the index entry
+  const indexKey = `inbox:${name}:index`;
+  const indexRaw = await env.EMAIL_KV.get(indexKey);
+  if (indexRaw) {
+    let index = [];
+    try { index = JSON.parse(indexRaw); } catch {}
+    const entry = index.find(e => e.messageId === messageId);
+    if (entry) {
+      entry.read = true;
+      await env.EMAIL_KV.put(indexKey, JSON.stringify(index));
+    }
+  }
+
+  return json({ success: true, messageId, read: true });
+}
+
+async function handleDeleteEmail(name, messageId, env) {
+  // Delete the email record
+  const emailKey = `inbox:${name}:${messageId}`;
+  await env.EMAIL_KV.delete(emailKey);
+
+  // Remove from index
+  const indexKey = `inbox:${name}:index`;
+  const indexRaw = await env.EMAIL_KV.get(indexKey);
+  if (indexRaw) {
+    let index = [];
+    try { index = JSON.parse(indexRaw); } catch {}
+    index = index.filter(e => e.messageId !== messageId);
+    await env.EMAIL_KV.put(indexKey, JSON.stringify(index));
+  }
+
+  return json({ success: true, messageId, deleted: true });
+}
+
+// ─── Helpers ─────────────────────────────────────────────
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+// ─── MIME Parsing (unchanged from original) ──────────────
 
 /**
  * Extract plain text body from raw MIME email.
@@ -117,25 +354,21 @@ export default {
  * Falls back to stripping HTML tags if only HTML is available.
  */
 function extractTextBody(raw) {
-  // Check if this is a multipart message
   const contentTypeMatch = raw.match(/Content-Type:\s*([^\r\n;]+)/i);
   const contentType = contentTypeMatch ? contentTypeMatch[1].trim().toLowerCase() : '';
 
-  // Try to find boundary for multipart
   const boundaryMatch = raw.match(/boundary="?([^"\r\n;]+)"?/i);
 
   if (boundaryMatch) {
     const boundary = boundaryMatch[1];
     const parts = raw.split('--' + boundary);
 
-    // Look for text/plain part first
     for (const part of parts) {
       if (/Content-Type:\s*text\/plain/i.test(part)) {
         return extractPartBody(part);
       }
     }
 
-    // Fall back to text/html, strip tags
     for (const part of parts) {
       if (/Content-Type:\s*text\/html/i.test(part)) {
         const html = extractPartBody(part);
@@ -144,7 +377,6 @@ function extractTextBody(raw) {
     }
   }
 
-  // Not multipart — extract body after headers
   const headerEnd = raw.indexOf('\r\n\r\n');
   if (headerEnd !== -1) {
     const body = raw.slice(headerEnd + 4);
@@ -154,13 +386,9 @@ function extractTextBody(raw) {
     return body.trim();
   }
 
-  // Last resort
   return raw.trim();
 }
 
-/**
- * Extract the body portion of a MIME part (after the part's headers).
- */
 function extractPartBody(part) {
   const headerEnd = part.indexOf('\r\n\r\n');
   if (headerEnd === -1) {
@@ -170,12 +398,10 @@ function extractPartBody(part) {
   }
   let body = part.slice(headerEnd + 4).trim();
 
-  // Handle quoted-printable encoding
   if (/Content-Transfer-Encoding:\s*quoted-printable/i.test(part)) {
     body = decodeQuotedPrintable(body);
   }
 
-  // Handle base64 encoding
   if (/Content-Transfer-Encoding:\s*base64/i.test(part)) {
     try {
       body = atob(body.replace(/\s/g, ''));
@@ -187,18 +413,12 @@ function extractPartBody(part) {
   return body;
 }
 
-/**
- * Decode quoted-printable encoding.
- */
 function decodeQuotedPrintable(str) {
   return str
-    .replace(/=\r?\n/g, '') // soft line breaks
+    .replace(/=\r?\n/g, '')
     .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
-/**
- * Strip HTML tags and decode common entities.
- */
 function stripHtml(html) {
   return html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
