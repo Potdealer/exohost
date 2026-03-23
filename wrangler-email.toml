@@ -1,0 +1,16 @@
+name = "mfer-one-email"
+main = "email-worker.js"
+compatibility_date = "2024-01-01"
+account_id = "51f3f8b54088094bb9555609cf8da36c"
+
+[vars]
+WEBHOOK_BASE_URL = "http://localhost:8430"
+
+# FALLBACK_EMAIL is set via wrangler secret to avoid committing email addresses
+# Run: npx wrangler secret put FALLBACK_EMAIL -c wrangler-email.toml
+
+# Email routing configuration
+# After deploying, configure in Cloudflare dashboard:
+# 1. Go to mfer.one domain > Email > Email Routing
+# 2. Add catch-all rule: *@mfer.one -> Worker: mfer-one-email
+# 3. This routes ALL @mfer.one email to this worker
